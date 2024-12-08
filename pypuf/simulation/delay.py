@@ -650,3 +650,82 @@ class InterposePUF(Simulation):
         )
         assert down_challenges.shape == (N, n + 1)
         return self.down.eval(down_challenges)
+
+class IsingPUF(Simulation):
+    """
+    Ising PUF. Essentially consisting of a matrix of cells with spin values (-1 or 1). Each cell contains an Arbiter PUF
+    that takes as a challenge the spin values of it's neighbouring cells, and it's response determines the spin value of
+    the cell. If a cell is marked as dark, it applies an XOR operation on the spin values of it's neighbouring cells.
+    The response is calculated by applying an XOR operation on the spin values of the cells.
+    Hiromitsu Awano and Takashi Sato,
+    "Ising-PUF: A machine learning attack resistant PUF featuring lattice like arrangement of arbiter-PUFs.",
+    2018 Design, Automation & Test in Europe Conference & Exhibition (DATE). IEEE, 2018.
+    """
+
+    def __init__(self, N: int, M: int, seed: int = None, annealing_steps: int = 10, noisiness: float = 0):
+        from ..metrics import reliability
+        self.N = N
+        self.M = M
+        self.random = np.random.default_rng(seed or self.seed('default'))
+        self.mini_puf_matrix = []
+        for i in range(N):
+            row = []
+            for j in range(M):
+                mini_puf = ArbiterPUF(n=4, seed=self.random.integers(low=0, high=10**8), noisiness=noisiness)
+                rel = np.average( reliability(mini_puf, seed=1) )
+                if rel >= 0.8:
+                    row.append(mini_puf)
+                else:
+                    # mark as dark-cell
+                    row.append(None)
+            self.mini_puf_matrix.append(row)
+        self.annealing_steps = annealing_steps
+
+    @property
+    def challenge_length(self) -> int:
+        return self.N * self.M
+
+    @property
+    def response_length(self) -> int:
+        return 1
+
+    def _to_fields(self, challenges: ndarray) -> ndarray:
+        (n, _) = challenges.shape
+        return challenges.reshape(n, self.N, self.M)
+
+    def eval(self, challenges: ndarray) -> ndarray:
+        assert len(challenges.shape) == 2 and challenges.shape[1] == self.challenge_length, \
+            f'Challenges had shape ({challenges.shape}), but shape (n, {self.challenge_length}) was expected'
+
+        fields = self._to_fields(challenges)
+        responses = np.empty(shape=(fields.shape[0],), dtype=np.int8)
+        for i in range(fields.shape[0]):
+            new_field = fields[i].copy()
+            for j in range(self.annealing_steps):
+                new_field = self._ising_step(new_field)
+            responses[i] = np.prod(new_field)
+
+        return responses
+
+    def _ising_step(self, field: ndarray) -> ndarray:
+        new_field = np.empty(field.shape, dtype=np.int8)
+        for n in range(self.N):
+            for m in range(self.M):
+                new_field[n, m] = self._ising_update(field, n, m)
+        return new_field
+
+    def _ising_update(self, field: ndarray, n, m) -> np.int8:
+        _default = -1
+        neighbours = []
+        for cell in ((n - 1, m), (n + 1, m), (n, m - 1), (n, m + 1)):
+            try:
+                neighbours.append(field[cell])
+            except IndexError:
+                neighbours.append(_default)
+        mini_challenge = np.asarray([neighbours], dtype=np.int8)
+        if self.mini_puf_matrix[n][m] is not None:
+            result = self.mini_puf_matrix[n][m].eval(mini_challenge)[0]
+        else:
+            # apply XOR
+            result = np.prod(mini_challenge)
+        return result
